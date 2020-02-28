@@ -145,7 +145,7 @@ import scala.concurrent.Future
  *   the invoker may skip container launch in case there is concurrent capacity available for a container launched via
  *   some other loadbalancer.
  */
-class SlotBalancer(
+class LeastLoadedBalancer(
   config: WhiskConfig,
   controllerInstance: ControllerInstanceId,
   feedFactory: FeedFactory,
@@ -206,7 +206,7 @@ class SlotBalancer(
   }
 
   /** State needed for scheduling. */
-  val schedulingState = SlotBalancerState()(lbConfig)
+  val schedulingState = LeastLoadedBalancerState()(lbConfig)
 
   /** 6. Process the completion ack and update the state */
   override protected[loadBalancer] def processCompletion(aid: ActivationId,
@@ -302,7 +302,7 @@ class SlotBalancer(
    * Monitors invoker supervision and the cluster to update the state sequentially
    *
    * All state updates should go through this actor to guarantee that
-   * [[SlotBalancerState.updateInvokers]] and [[SlotBalancerState.updateCluster]]
+   * [[LeastLoadedBalancerState.updateInvokers]] and [[LeastLoadedBalancerState.updateCluster]]
    * are called exclusive of each other and not concurrently.
    */
   private val monitor = actorSystem.actorOf(Props(new Actor {
@@ -355,10 +355,10 @@ class SlotBalancer(
       if (!isBlackboxInvocation) (schedulingState.managedInvokers, schedulingState.managedStepSizes)
       else (schedulingState.blackboxInvokers, schedulingState.blackboxStepSizes)
     val chosen = if (invokersToUse.nonEmpty) {
-      val hash = SlotBalancer.generateHash(msg.user.namespace.name, action.fullyQualifiedName(false))
+      val hash = LeastLoadedBalancer.generateHash(msg.user.namespace.name, action.fullyQualifiedName(false))
       val homeInvoker = hash % invokersToUse.size
       val stepSize = stepSizes(hash % stepSizes.size)
-      val invoker: Option[(InvokerInstanceId, Boolean)] = SlotBalancer.schedule(
+      val invoker: Option[(InvokerInstanceId, Boolean)] = LeastLoadedBalancer.schedule(
         action.limits.concurrency.maxConcurrent,
         action.fullyQualifiedName(true),
         invokersToUse,
@@ -424,7 +424,7 @@ class SlotBalancer(
   }
 }
 
-object SlotBalancer extends LoadBalancerProvider {
+object LeastLoadedBalancer extends LoadBalancerProvider {
 
   override def instance(whiskConfig: WhiskConfig, instance: ControllerInstanceId)(
     implicit actorSystem: ActorSystem,
@@ -450,7 +450,7 @@ object SlotBalancer extends LoadBalancerProvider {
       }
 
     }
-    new SlotBalancer(
+    new LeastLoadedBalancer(
       whiskConfig,
       instance,
       createFeedFactory(whiskConfig, instance),
@@ -539,13 +539,13 @@ object SlotBalancer extends LoadBalancerProvider {
  * @param _blackboxStepSizes the step-sizes possible for the current blackbox invoker count
  * @param _invokerSlots state of accessible slots of each invoker
  */
-case class SlotBalancerState(
+case class LeastLoadedBalancerState(
   private var _invokers: IndexedSeq[InvokerHealth] = IndexedSeq.empty[InvokerHealth],
   private var _invokerLoads: IndexedSeq[Int] = IndexedSeq.empty[Int],
   private var _managedInvokers: IndexedSeq[InvokerHealth] = IndexedSeq.empty[InvokerHealth],
   private var _blackboxInvokers: IndexedSeq[InvokerHealth] = IndexedSeq.empty[InvokerHealth],
-  private var _managedStepSizes: Seq[Int] = SlotBalancer.pairwiseCoprimeNumbersUntil(0),
-  private var _blackboxStepSizes: Seq[Int] = SlotBalancer.pairwiseCoprimeNumbersUntil(0),
+  private var _managedStepSizes: Seq[Int] = LeastLoadedBalancer.pairwiseCoprimeNumbersUntil(0),
+  private var _blackboxStepSizes: Seq[Int] = LeastLoadedBalancer.pairwiseCoprimeNumbersUntil(0),
   protected[loadBalancer] var _invokerSlots: IndexedSeq[NestedSemaphore[FullyQualifiedEntityName]] =
     IndexedSeq.empty[NestedSemaphore[FullyQualifiedEntityName]],
   private var _clusterSize: Int = 1)(
@@ -633,8 +633,8 @@ case class SlotBalancerState(
     _blackboxInvokers = _invokers.takeRight(blackboxes)
 
     val logDetail = if (oldSize != newSize) {
-      _managedStepSizes = SlotBalancer.pairwiseCoprimeNumbersUntil(managed)
-      _blackboxStepSizes = SlotBalancer.pairwiseCoprimeNumbersUntil(blackboxes)
+      _managedStepSizes = LeastLoadedBalancer.pairwiseCoprimeNumbersUntil(managed)
+      _blackboxStepSizes = LeastLoadedBalancer.pairwiseCoprimeNumbersUntil(blackboxes)
 
       if (oldSize < newSize) {
         // Keeps the existing state..
@@ -709,7 +709,7 @@ case class SlotBalancerState(
  * @param timeoutAddon extra time to influence the timeout period for forced active acks (time-limit.std * timeoutFactor + timeoutAddon)
  */
 /*
-case class SlotBalancerConfig(managedFraction: Double,
+case class LeastLoadedBalancerConfig(managedFraction: Double,
                                                blackboxFraction: Double,
                                                timeoutFactor: Int,
                                                timeoutAddon: FiniteDuration)
