@@ -100,7 +100,7 @@ abstract class CommonLoadBalancer(config: WhiskConfig,
    * @param actionTimeLimit the action's time limit
    * @return the calculated time duration within which a completion ack must be received
    */
-  private def calculateCompletionAckTimeout(actionTimeLimit: FiniteDuration): FiniteDuration = {
+  protected def calculateCompletionAckTimeout(actionTimeLimit: FiniteDuration): FiniteDuration = {
     (actionTimeLimit.max(TimeLimit.STD_DURATION) * lbConfig.timeoutFactor) + lbConfig.timeoutAddon
   }
 
