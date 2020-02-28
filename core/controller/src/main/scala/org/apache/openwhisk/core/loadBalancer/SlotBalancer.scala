@@ -242,7 +242,8 @@ class SlotBalancer(
           // notice here that the activationPromises is not touched, because the expectation is that
           // the active ack is received as expected, and processing that message removed the promise
           // from the corresponding map
-          logging.info(this, s"received BOOM completion ack for '$aid', system error=$isSystemError")(tid)
+          schedulingState.decreaseInvokerLoad(invoker.toInt)
+          logging.info(this, s"received completion ack for '$aid', $invoker={invoker}, loads=${invokerLoads}, system error=$isSystemError")(tid)
 
           MetricEmitter.emitCounterMetric(LOADBALANCER_COMPLETION_ACK_REGULAR)
 
@@ -255,6 +256,7 @@ class SlotBalancer(
           val actionType = if (entry.isBlackbox) "blackbox" else "managed"
           val blockingType = if (entry.isBlocking) "blocking" else "non-blocking"
           val completionAckTimeout = calculateCompletionAckTimeout(entry.timeLimit)
+          schedulingState.decreaseInvokerLoad(invoker.toInt)
           logging.warn(
             this,
             s"forced completion ack for '$aid', action '${entry.fullyQualifiedEntityName}' ($actionType), $blockingType, mem limit ${entry.memoryLimit.toMB} MB, time limit ${entry.timeLimit.toMillis} ms, completion ack timeout $completionAckTimeout from $invoker")(
@@ -341,7 +343,7 @@ class SlotBalancer(
   /** Loadbalancer interface methods */
   override def invokerHealth(): Future[IndexedSeq[InvokerHealth]] = Future.successful(schedulingState.invokers)
   override def clusterSize: Int = schedulingState.clusterSize
-  def invokerLoads(): Future[IndexedSeq[Int]] = Future.successful(schedulingState.invokerLoads)
+  def invokerLoads(): IndexedSeq[Int] = schedulingState.invokerLoads
 
   /** 1. Publish a message to the loadbalancer */
   override def publish(action: ExecutableWhiskActionMetaData, msg: ActivationMessage)(
@@ -386,9 +388,10 @@ class SlotBalancer(
         val memoryLimitInfo = if (memoryLimit == MemoryLimit()) { "std" } else { "non-std" }
         val timeLimit = action.limits.timeout
         val timeLimitInfo = if (timeLimit == TimeLimit()) { "std" } else { "non-std" }
+        schedulingState.increaseInvokerLoad(invoker.toInt)
         logging.info(
           this,
-          s"scheduled activation ${msg.activationId}, action '${msg.action.asString}' ($actionType), ns '${msg.user.namespace.name.asString}', mem limit ${memoryLimit.megabytes} MB (${memoryLimitInfo}), time limit ${timeLimit.duration.toMillis} ms (${timeLimitInfo}) to ${invoker}")
+          s"scheduled activation ${msg.activationId}, action '${msg.action.asString}' ($actionType), ns '${msg.user.namespace.name.asString}', mem limit ${memoryLimit.megabytes} MB (${memoryLimitInfo}), time limit ${timeLimit.duration.toMillis} ms (${timeLimitInfo}) to ${invoker} with overall loads ${invokerLoads}")
         val activationResult = setupActivation(msg, action, invoker)
         sendActivationToInvoker(messageProducer, msg, invoker).map(_ => activationResult)
       }
@@ -538,7 +541,7 @@ object SlotBalancer extends LoadBalancerProvider {
  */
 case class SlotBalancerState(
   private var _invokers: IndexedSeq[InvokerHealth] = IndexedSeq.empty[InvokerHealth],
-  private var _invoker_loads: IndexedSeq[Int] = IndexedSeq.empty[Int],
+  private var _invokerLoads: IndexedSeq[Int] = IndexedSeq.empty[Int],
   private var _managedInvokers: IndexedSeq[InvokerHealth] = IndexedSeq.empty[InvokerHealth],
   private var _blackboxInvokers: IndexedSeq[InvokerHealth] = IndexedSeq.empty[InvokerHealth],
   private var _managedStepSizes: Seq[Int] = SlotBalancer.pairwiseCoprimeNumbersUntil(0),
@@ -562,7 +565,7 @@ case class SlotBalancerState(
 
   /** Getters for the variables, setting from the outside is only allowed through the update methods below */
   def invokers: IndexedSeq[InvokerHealth] = _invokers
-  def invokerLoads: IndexedSeq[Int] = _invoker_loads
+  def invokerLoads: IndexedSeq[Int] = _invokerLoads
   def managedInvokers: IndexedSeq[InvokerHealth] = _managedInvokers
   def blackboxInvokers: IndexedSeq[InvokerHealth] = _blackboxInvokers
   def managedStepSizes: Seq[Int] = _managedStepSizes
@@ -590,6 +593,16 @@ case class SlotBalancerState(
     newTreshold
   }
 
+  /** Update invoker loads.
+   *
+   */
+  def increaseInvokerLoad(invokerId: Int) = {
+    _invokerLoads = _invokerLoads.updated(invokerId,  _invokerLoads(invokerId) + 1)
+  }
+  def decreaseInvokerLoad(invokerId: Int) = {
+    _invokerLoads = _invokerLoads.updated(invokerId,  _invokerLoads(invokerId) - 1)
+  }
+
   /**
    * Updates the scheduling state with the new invokers.
    *
@@ -604,6 +617,11 @@ case class SlotBalancerState(
   def updateInvokers(newInvokers: IndexedSeq[InvokerHealth]): Unit = {
     val oldSize = _invokers.size
     val newSize = newInvokers.size
+
+    // TODO: Make sure that we do not lose old loads here.
+    if (oldSize != newSize) {
+      _invokerLoads = IndexedSeq.fill(newSize)(0)
+    }
 
     // for small N, allow the managed invokers to overlap with blackbox invokers, and
     // further assume that blackbox invokers << managed invokers
