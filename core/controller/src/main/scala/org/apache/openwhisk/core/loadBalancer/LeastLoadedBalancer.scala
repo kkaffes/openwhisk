@@ -354,6 +354,9 @@ class LeastLoadedBalancer(
     val (invokersToUse, stepSizes) =
       if (!isBlackboxInvocation) (schedulingState.managedInvokers, schedulingState.managedStepSizes)
       else (schedulingState.blackboxInvokers, schedulingState.blackboxStepSizes)
+    val leastLoadedIndex = invokerLoads.zipWithIndex.min._2
+    val chosen = Some(invokersToUse(leastLoadedIndex).id)
+    /*
     val chosen = if (invokersToUse.nonEmpty) {
       val hash = LeastLoadedBalancer.generateHash(msg.user.namespace.name, action.fullyQualifiedName(false))
       val homeInvoker = hash % invokersToUse.size
@@ -381,6 +384,7 @@ class LeastLoadedBalancer(
       None
     }
 
+    */
     chosen
       .map { invoker =>
         // MemoryLimit() and TimeLimit() return singletons - they should be fast enough to be used here
