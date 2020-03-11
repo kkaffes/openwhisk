@@ -42,6 +42,7 @@ import org.apache.openwhisk.core.{ConfigKeys, WhiskConfig}
 import org.apache.openwhisk.spi.SpiLoader
 
 import scala.annotation.tailrec
+import scala.collection.mutable.Queue
 import scala.concurrent.Future
 
 class LateBindingBalancer(
@@ -142,7 +143,9 @@ class LateBindingBalancer(
           // the active ack is received as expected, and processing that message removed the promise
           // from the corresponding map
           schedulingState.decreaseInvokerLoad(invoker.toInt)
-          logging.info(this, s"received completion ack for '$aid', $invoker={invoker}, loads=${invokerLoads}, system error=$isSystemError")(tid)
+          schedulingState.increaseInvokerCapacity(invoker.toInt)
+          logging.info(this, s"received completion ack for '$aid', $invoker={invoker}, capacity=${schedulingState.invokerCapacity}, system error=$isSystemError")(tid)
+          scheduleQueuedActivation(invoker.toInt)
 
           MetricEmitter.emitCounterMetric(LOADBALANCER_COMPLETION_ACK_REGULAR)
 
@@ -248,13 +251,31 @@ class LateBindingBalancer(
   override def publish(action: ExecutableWhiskActionMetaData, msg: ActivationMessage)(
     implicit transid: TransactionId): Future[Future[Either[ActivationId, WhiskActivation]]] = {
 
+    var invokerIndex = -1
+    var lookingForInvoker = true
     val isBlackboxInvocation = action.exec.pull
     val actionType = if (!isBlackboxInvocation) "managed" else "blackbox"
     val (invokersToUse, stepSizes) =
       if (!isBlackboxInvocation) (schedulingState.managedInvokers, schedulingState.managedStepSizes)
       else (schedulingState.blackboxInvokers, schedulingState.blackboxStepSizes)
-    val leastLoadedIndex = invokerLoads.zipWithIndex.min._2
-    val chosen = Some(invokersToUse(leastLoadedIndex).id)
+   // FIXME Fix this ugly piece of code
+   for ( x <- 0 to schedulingState.invokerCapacity.length - 1) {
+      if (lookingForInvoker) {
+        if (schedulingState.decreaseInvokerCapacity(x)) {
+          invokerIndex = x
+          lookingForInvoker = false
+        }
+      }
+    }
+
+    if (invokerIndex == -1) {
+      schedulingState.enqueueActivation(action, msg)
+      logging.info(
+          this,
+          s"enqueued activation ${msg.activationId}, action '${msg.action.asString}' ($actionType), ns '${msg.user.namespace.name.asString}', with overall capacity ${schedulingState.invokerCapacity}")
+      return Future.successful(Future.successful(Left(msg.activationId)))
+    }
+    val chosen = Some(invokersToUse(invokerIndex).id)
 
     chosen
       .map { invoker =>
@@ -266,9 +287,10 @@ class LateBindingBalancer(
         schedulingState.increaseInvokerLoad(invoker.toInt)
         logging.info(
           this,
-          s"scheduled activation ${msg.activationId}, action '${msg.action.asString}' ($actionType), ns '${msg.user.namespace.name.asString}', mem limit ${memoryLimit.megabytes} MB (${memoryLimitInfo}), time limit ${timeLimit.duration.toMillis} ms (${timeLimitInfo}) to ${invoker} with overall loads ${invokerLoads}")
+          s"scheduled activation ${msg.activationId}, action '${msg.action.asString}' ($actionType), ns '${msg.user.namespace.name.asString}', mem limit ${memoryLimit.megabytes} MB (${memoryLimitInfo}), time limit ${timeLimit.duration.toMillis} ms (${timeLimitInfo}) to ${invoker} with overall capacity ${schedulingState.invokerCapacity}")
         val activationResult = setupActivation(msg, action, invoker)
         sendActivationToInvoker(messageProducer, msg, invoker).map(_ => activationResult)
+        Future.successful(Future.successful(Left(msg.activationId)))
       }
       .getOrElse {
         // report the state of all invokers
@@ -282,6 +304,47 @@ class LateBindingBalancer(
           s"failed to schedule activation ${msg.activationId}, action '${msg.action.asString}' ($actionType), ns '${msg.user.namespace.name.asString}' - invokers to use: $invokerStates")
         Future.failed(LoadBalancerException("No invokers available"))
       }
+  }
+
+  def scheduleQueuedActivation(invokerId: Int) = {
+    val actionType = "managed"
+    val activation = schedulingState.returnPendingActivation()
+    activation match {
+      case Right(x) => logging.info(this, s"No queued activation found")
+      case Left(x) => {
+         val invokersToUse = schedulingState.managedInvokers
+         val action = x._1
+         val msg = x._2
+         val chosen = Some(invokersToUse(invokerId).id)
+
+         chosen
+           .map { invoker =>
+           // MemoryLimit() and TimeLimit() return singletons - they should be fast enough to be used here
+           val memoryLimit = action.limits.memory
+           val memoryLimitInfo = if (memoryLimit == MemoryLimit()) { "std" } else { "non-std" }
+           val timeLimit = action.limits.timeout
+           val timeLimitInfo = if (timeLimit == TimeLimit()) { "std" } else { "non-std" }
+           schedulingState.decreaseInvokerCapacity(invoker.toInt)
+           logging.info(
+             this,
+          s"scheduled QUEUED activation ${msg.activationId}, action '${msg.action.asString}' ($actionType), ns '${msg.user.namespace.name.asString}', mem limit ${memoryLimit.megabytes} MB (${memoryLimitInfo}), time limit ${timeLimit.duration.toMillis} ms (${timeLimitInfo}) to ${invoker} with overall loads ${invokerLoads}")
+           val activationResult = setupActivation(msg, action, invoker)
+           sendActivationToInvoker(messageProducer, msg, invoker).map(_ => activationResult)
+         }
+         .getOrElse {
+           // report the state of all invokers
+           val invokerStates = invokersToUse.foldLeft(Map.empty[InvokerState, Int]) { (agg, curr) =>
+             val count = agg.getOrElse(curr.status, 0) + 1
+             agg + (curr.status -> count)
+           }
+
+           logging.error(
+             this,
+             s"failed to schedule QUEUED activation ${msg.activationId}, action '${msg.action.asString}' ($actionType), ns '${msg.user.namespace.name.asString}' - invokers to use: $invokerStates")
+           Future.failed(LoadBalancerException("No invokers available"))
+         }
+      }
+    }
   }
 
   override val invokerPool =
@@ -415,8 +478,10 @@ object LateBindingBalancer extends LoadBalancerProvider {
  * @param _invokerSlots state of accessible slots of each invoker
  */
 case class LateBindingBalancerState(
+  private var _activationList: Queue[(ExecutableWhiskActionMetaData, ActivationMessage)] = Queue[(ExecutableWhiskActionMetaData, ActivationMessage)](),
   private var _invokers: IndexedSeq[InvokerHealth] = IndexedSeq.empty[InvokerHealth],
   private var _invokerLoads: IndexedSeq[Int] = IndexedSeq.empty[Int],
+  private var _invokerCapacity: IndexedSeq[Int] = IndexedSeq.empty[Int],
   private var _managedInvokers: IndexedSeq[InvokerHealth] = IndexedSeq.empty[InvokerHealth],
   private var _blackboxInvokers: IndexedSeq[InvokerHealth] = IndexedSeq.empty[InvokerHealth],
   private var _managedStepSizes: Seq[Int] = LateBindingBalancer.pairwiseCoprimeNumbersUntil(0),
@@ -441,6 +506,7 @@ case class LateBindingBalancerState(
   /** Getters for the variables, setting from the outside is only allowed through the update methods below */
   def invokers: IndexedSeq[InvokerHealth] = _invokers
   def invokerLoads: IndexedSeq[Int] = _invokerLoads
+  def invokerCapacity: IndexedSeq[Int] = _invokerCapacity
   def managedInvokers: IndexedSeq[InvokerHealth] = _managedInvokers
   def blackboxInvokers: IndexedSeq[InvokerHealth] = _blackboxInvokers
   def managedStepSizes: Seq[Int] = _managedStepSizes
@@ -478,6 +544,30 @@ case class LateBindingBalancerState(
     _invokerLoads = _invokerLoads.updated(invokerId,  _invokerLoads(invokerId) - 1)
   }
 
+  def increaseInvokerCapacity(invokerId: Int) = {
+    _invokerCapacity = _invokerCapacity.updated(invokerId,  _invokerCapacity(invokerId) + 1)
+  }
+
+  def decreaseInvokerCapacity(invokerId: Int) : Boolean = {
+    if (invokerCapacity(invokerId) > 0) {
+      _invokerCapacity = _invokerCapacity.updated(invokerId,  _invokerCapacity(invokerId) - 1)
+      true
+    } else {
+      false
+    }
+  }
+
+  def enqueueActivation(action: ExecutableWhiskActionMetaData, msg: ActivationMessage) = {
+    _activationList.enqueue((action, msg))
+  }
+
+  def returnPendingActivation() : Either[(ExecutableWhiskActionMetaData, ActivationMessage),Boolean] ={
+    _activationList.isEmpty match {
+      case true => Right(false)
+      case _ => Left(_activationList.dequeue)
+    }
+  }
+
   /**
    * Updates the scheduling state with the new invokers.
    *
@@ -496,6 +586,7 @@ case class LateBindingBalancerState(
     // TODO: Make sure that we do not lose old loads here.
     if (oldSize != newSize) {
       _invokerLoads = IndexedSeq.fill(newSize)(0)
+      _invokerCapacity = IndexedSeq.fill(newSize)(8)
     }
 
     // for small N, allow the managed invokers to overlap with blackbox invokers, and
