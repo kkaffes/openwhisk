@@ -143,7 +143,6 @@ class LateBindingBalancer(
           // the active ack is received as expected, and processing that message removed the promise
           // from the corresponding map
           schedulingState.decreaseInvokerLoad(invoker.toInt)
-          schedulingState.increaseInvokerCapacity(invoker.toInt)
           logging.info(this, s"received completion ack for '$aid', $invoker={invoker}, capacity=${schedulingState.invokerCapacity}, system error=$isSystemError")(tid)
           scheduleQueuedActivation(invoker.toInt)
 
@@ -310,7 +309,10 @@ class LateBindingBalancer(
     val actionType = "managed"
     val activation = schedulingState.returnPendingActivation()
     activation match {
-      case Right(x) => logging.info(this, s"No queued activation found")
+      case Right(x) => {
+         schedulingState.increaseInvokerCapacity(invokerId)
+         logging.info(this, s"No queued activation found")
+      }
       case Left(x) => {
          val invokersToUse = schedulingState.managedInvokers
          val action = x._1
@@ -324,7 +326,6 @@ class LateBindingBalancer(
            val memoryLimitInfo = if (memoryLimit == MemoryLimit()) { "std" } else { "non-std" }
            val timeLimit = action.limits.timeout
            val timeLimitInfo = if (timeLimit == TimeLimit()) { "std" } else { "non-std" }
-           schedulingState.decreaseInvokerCapacity(invoker.toInt)
            logging.info(
              this,
           s"scheduled QUEUED activation ${msg.activationId}, action '${msg.action.asString}' ($actionType), ns '${msg.user.namespace.name.asString}', mem limit ${memoryLimit.megabytes} MB (${memoryLimitInfo}), time limit ${timeLimit.duration.toMillis} ms (${timeLimitInfo}) to ${invoker} with overall loads ${invokerLoads}")
@@ -545,26 +546,34 @@ case class LateBindingBalancerState(
   }
 
   def increaseInvokerCapacity(invokerId: Int) = {
-    _invokerCapacity = _invokerCapacity.updated(invokerId,  _invokerCapacity(invokerId) + 1)
+    this.synchronized {
+      _invokerCapacity = _invokerCapacity.updated(invokerId,  _invokerCapacity(invokerId) + 1)
+    }
   }
 
   def decreaseInvokerCapacity(invokerId: Int) : Boolean = {
+    this.synchronized {
     if (invokerCapacity(invokerId) > 0) {
       _invokerCapacity = _invokerCapacity.updated(invokerId,  _invokerCapacity(invokerId) - 1)
       true
     } else {
       false
     }
+   }
   }
 
   def enqueueActivation(action: ExecutableWhiskActionMetaData, msg: ActivationMessage) = {
-    _activationList.enqueue((action, msg))
+    this.synchronized {
+      _activationList.enqueue((action, msg))
+    }
   }
 
   def returnPendingActivation() : Either[(ExecutableWhiskActionMetaData, ActivationMessage),Boolean] ={
-    _activationList.isEmpty match {
-      case true => Right(false)
-      case _ => Left(_activationList.dequeue)
+    this.synchronized {
+      _activationList.isEmpty match {
+        case true => Right(false)
+        case _ => Left(_activationList.dequeue)
+      }
     }
   }
 
@@ -586,7 +595,7 @@ case class LateBindingBalancerState(
     // TODO: Make sure that we do not lose old loads here.
     if (oldSize != newSize) {
       _invokerLoads = IndexedSeq.fill(newSize)(0)
-      _invokerCapacity = IndexedSeq.fill(newSize)(8)
+      _invokerCapacity = IndexedSeq.fill(newSize)(12)
     }
 
     // for small N, allow the managed invokers to overlap with blackbox invokers, and
