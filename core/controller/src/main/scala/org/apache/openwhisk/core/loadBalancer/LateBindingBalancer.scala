@@ -595,7 +595,7 @@ case class LateBindingBalancerState(
     // TODO: Make sure that we do not lose old loads here.
     if (oldSize != newSize) {
       _invokerLoads = IndexedSeq.fill(newSize)(0)
-      _invokerCapacity = IndexedSeq.fill(newSize)(12)
+      _invokerCapacity = IndexedSeq.fill(newSize)(8)
     }
 
     // for small N, allow the managed invokers to overlap with blackbox invokers, and
